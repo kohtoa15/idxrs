@@ -5,6 +5,7 @@ use std::io::SeekFrom;
 use std::convert::TryFrom;
 use std::convert::TryInto;
 
+#[derive(Debug)]
 pub enum IdxError {
     DimensionMismatch{ needed: u8 , supplied: u8 },
     OutOfBounds{ dimension: u8, max: u32, index: u32},
@@ -12,32 +13,6 @@ pub enum IdxError {
     IoError(io::Error),
     UnknownDataType,
     CannotCast,
-}
-
-/// Looks up data type and creates cursor for the type
-pub fn create_idx_cursor<R: Read + Seek>(mut reader: R) -> Result<IdxCursor<R>, IdxError> {
-    // Read first 4 bytes to get magic number
-    let mut buf: [u8; 4] = [0; 4];
-    reader.read_exact(&mut buf).map_err(|e| IdxError::IoError(e))?;
-
-    // First two bytes must be 0
-    if buf[0] != 0 || buf[1] != 0 {
-        return Err(IdxError::WrongHeader);
-    }
-
-    // Read data type from third byte
-    let data_type = IdxDataType::read(buf[2])?;
-
-    // Number of dimensions are stored in fourth byte
-    // Read n next numbers of dimension sizes (each 32bit)
-    let n: usize = buf[3] as usize;
-    let mut dimensions: Vec<u32> = Vec::with_capacity(n);
-    for _i in 0..n {
-        reader.read_exact(&mut buf).map_err(|e| IdxError::IoError(e))?;
-        dimensions.push(u32::from_be_bytes(buf));
-    }
-    // Return Cursor type
-    Ok(IdxCursor::from(reader, dimensions, data_type))
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -125,18 +100,40 @@ impl TryFrom<(IdxDataType, Box<[u8]>)> for IdxValue {
 
 pub struct IdxCursor<R: Read + Seek> {
     reader: R,
-    dimensions: Vec<u32>,
+    pub dimensions: Vec<u32>,
     data_type: IdxDataType,
 }
 
 impl<R: Read + Seek> IdxCursor<R> {
-    pub fn from(reader: R, dimensions: Vec<u32>, data_type: IdxDataType) -> IdxCursor<R> {
-        IdxCursor {
-            reader, dimensions, data_type
+    /// Looks up data type and creates cursor for the type
+    pub fn new(mut reader: R) -> Result<IdxCursor<R>, IdxError> {
+        // Read first 4 bytes to get magic number
+        let mut buf: [u8; 4] = [0; 4];
+        reader.read_exact(&mut buf).map_err(|e| IdxError::IoError(e))?;
+
+        // First two bytes must be 0
+        if buf[0] != 0 || buf[1] != 0 {
+            return Err(IdxError::WrongHeader);
         }
+
+        // Read data type from third byte
+        let data_type = IdxDataType::read(buf[2])?;
+
+        // Number of dimensions are stored in fourth byte
+        // Read n next numbers of dimension sizes (each 32bit)
+        let n: usize = buf[3] as usize;
+        let mut dimensions: Vec<u32> = Vec::with_capacity(n);
+        for _i in 0..n {
+            reader.read_exact(&mut buf).map_err(|e| IdxError::IoError(e))?;
+            dimensions.push(u32::from_be_bytes(buf));
+        }
+        // Return Cursor type
+        Ok(IdxCursor {
+            reader, dimensions, data_type
+        })
     }
 
-    pub fn get(&mut self, indices: &[u32]) -> Result<(IdxDataType, Box<[u8]>), IdxError> {
+    pub fn get(&mut self, indices: &[u32]) -> Result<IdxValue, IdxError> {
         // Throw index error if index parameter does not fit dimension count
         if indices.len() != self.dimensions.len() {
             return Err(IdxError::DimensionMismatch{ needed: self.dimensions.len() as u8, supplied: indices.len() as u8 });
@@ -151,8 +148,8 @@ impl<R: Read + Seek> IdxCursor<R> {
         let mut pos: u64 = 0;
         let mut mult: u64 = 1;
         for (dimension, index) in self.dimensions.iter().rev().zip(indices.iter().rev()) {
-            mult *= *dimension as u64;
             pos += *index as u64 * mult;
+            mult *= *dimension as u64;
         }
         // Manipulate position by data type intervals and header size
         pos *= self.data_type.get_size() as u64;
@@ -161,7 +158,7 @@ impl<R: Read + Seek> IdxCursor<R> {
         let _res = self.reader.seek(SeekFrom::Start(pos)).map_err(|e| IdxError::IoError(e))?;
         let mut buffer = self.data_type.create_buf();
         self.reader.read_exact(&mut buffer).map_err(|e| IdxError::IoError(e))?;
-        Ok((self.data_type, buffer))
+        IdxValue::try_from((self.data_type, buffer))
     }
 }
 
